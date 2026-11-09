@@ -13,22 +13,19 @@
  *  "rocknix-singleadc-joypad"
  *	One IIO channel ("amux_adc") sits behind a 4:1 analog mux driven by
  *	the "amux-a"/"amux-b" (and optional "amux-en") GPIOs, read raw.
- *	This layout can also drive a PWM rumble motor and can take the
- *	sticks from the Miyoo serial controller on /dev/ttyS1 instead.
+ *	This layout can also drive a PWM rumble motor, and gives its input
+ *	device to the ROCKNIX adc-keys patch when the kernel carries it.
  *
  * In both layouts the buttons are the GPIOs of the child nodes, and
  * everything is polled at "poll-interval" ms while the device is open.
  */
 
 #include <linux/delay.h>
-#include <linux/fs.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iio/consumer.h>
 #include <linux/input.h>
-#include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/kstrtox.h>
-#include <linux/kthread.h>
 #include <linux/math.h>
 #include <linux/minmax.h>
 #include <linux/module.h>
@@ -39,8 +36,6 @@
 #include <linux/property.h>
 #include <linux/pwm.h>
 #include <linux/sysfs.h>
-#include <linux/termios.h>
-#include <linux/tty.h>
 #include <linux/version.h>
 #include <linux/workqueue.h>
 
@@ -51,37 +46,6 @@
 #define ADC_MAX_VOLTAGE		1800
 /* Tuning, in percent, used when an axis has no abs_<axis>-[pn]-tuning. */
 #define ADC_TUNING_DEFAULT	180
-
-/* Miyoo serial sticks (rocknix,use-miyoo-serial-joypad) */
-#define MIYOO_TTY_PATH			"/dev/ttyS1"
-#define MIYOO_FRAME_SIZE		6
-#define MIYOO_MAGIC_START		0xFF
-#define MIYOO_MAGIC_END			0xFE
-#define MIYOO_AXIS_MIN			(-32760)
-#define MIYOO_AXIS_MAX			32760
-#define MIYOO_AXIS_FUZZ			16
-#define MIYOO_AXIS_FLAT			16
-/* Raw range of each stick before auto-calibration replaces the centre. */
-#define MIYOO_RAW_MIN			85
-#define MIYOO_RAW_MAX			200
-#define MIYOO_RAW_ZERO			130
-/* Frames averaged to find the centre of each stick. */
-#define MIYOO_CALIBRATION_FRAMES	50
-/* Radial deadzone: 10% of MIYOO_AXIS_MAX, truncated (0.10f * 32760). */
-#define MIYOO_DEADZONE			3276
-/* Re-open the tty when no valid frame has arrived for this long. */
-#define MIYOO_INACTIVITY_TIMEOUT	(5 * HZ)
-/* Wait after probe before opening the tty, so boot is never blocked. */
-#define MIYOO_START_DELAY		(10 * HZ)
-
-/*
- * Exported by the ROCKNIX adc-keys kernel patch, which sends keycode 316
- * (BTN_MODE) from adc-keys to the joypad. The Makefile enables this only
- * for the device kernels that carry that patch.
- */
-#ifdef ROCKNIX_JOYPAD_ADC_KEYS_HOOK
-extern struct input_dev *joypad_input_g;
-#endif
 
 /*----------------------------------------------------------------------------*/
 enum joypad_layout {
@@ -147,24 +111,6 @@ struct joypad_button {
 	bool old_value;
 };
 
-struct joypad_miyoo_cal {
-	int min, max, zero;
-};
-
-struct joypad_miyoo {
-	/* [0] = x, [1] = y */
-	struct joypad_miyoo_cal left[2];
-	struct joypad_miyoo_cal right[2];
-
-	/* last values parsed by the reader thread */
-	int left_x, left_y, right_x, right_y;
-
-	struct file *filp;
-	struct task_struct *thread;
-	struct delayed_work start_work;
-	unsigned long last_data_jiffies;
-};
-
 struct joypad {
 	struct device *dev;
 	const struct joypad_variant *variant;
@@ -199,9 +145,8 @@ struct joypad {
 	u16 level;
 	u16 boost_weak, boost_strong;
 
-	/* single ADC layout: Miyoo serial sticks */
-	bool use_miyoo_serial;
-	struct joypad_miyoo miyoo;
+	/* single ADC layout: input device handed to the adc-keys patch */
+	bool adc_keys_hooked;
 };
 
 static inline bool joypad_is_single_adc(const struct joypad *joypad)
@@ -558,303 +503,31 @@ static void joypad_report_buttons(struct joypad *joypad)
 }
 
 /*----------------------------------------------------------------------------*/
-/* Miyoo serial sticks */
-
-static int joypad_miyoo_scale(const struct joypad_miyoo_cal *cal, int raw)
-{
-	int range_pos = cal->max - cal->zero;
-	int range_neg = cal->zero - cal->min;
-	int result = 0;
-
-	if (raw > cal->zero) {
-		if (range_pos != 0) {
-			result = ((raw - cal->zero) * MIYOO_AXIS_MAX) / range_pos;
-			if (result > MIYOO_AXIS_MAX)
-				result = MIYOO_AXIS_MAX;
-		}
-	} else if (raw < cal->zero) {
-		if (range_neg != 0) {
-			result = -((cal->zero - raw) * (-MIYOO_AXIS_MIN)) /
-				 range_neg;
-			if (result < MIYOO_AXIS_MIN)
-				result = MIYOO_AXIS_MIN;
-		}
-	}
-
-	return result;
-}
-
-static void joypad_miyoo_deadzone(int *x, int *y)
-{
-	long long mag_sq = (long long)*x * *x + (long long)*y * *y;
-	long long dead_sq = (long long)MIYOO_DEADZONE * MIYOO_DEADZONE;
-
-	if (mag_sq <= dead_sq) {
-		*x = 0;
-		*y = 0;
-	}
-}
-
-/* Frame layout: FF, left Y, left X, right Y, right X, FE */
-static void joypad_miyoo_parse(struct joypad *joypad, const u8 *frame)
-{
-	struct joypad_miyoo *miyoo = &joypad->miyoo;
-	int lx, ly, rx, ry;
-
-	if (frame[0] != MIYOO_MAGIC_START || frame[5] != MIYOO_MAGIC_END)
-		return;
-
-	/* A valid frame resets the inactivity timer. */
-	miyoo->last_data_jiffies = jiffies;
-
-	lx = joypad_miyoo_scale(&miyoo->left[0], frame[2]);
-	ly = joypad_miyoo_scale(&miyoo->left[1], frame[1]);
-	rx = joypad_miyoo_scale(&miyoo->right[0], frame[4]);
-	ry = joypad_miyoo_scale(&miyoo->right[1], frame[3]);
-
-	joypad_miyoo_deadzone(&lx, &ly);
-	joypad_miyoo_deadzone(&rx, &ry);
-
-	WRITE_ONCE(miyoo->left_x, lx);
-	WRITE_ONCE(miyoo->left_y, ly);
-	WRITE_ONCE(miyoo->right_x, rx);
-	WRITE_ONCE(miyoo->right_y, ry);
-}
-
-static ssize_t joypad_miyoo_read_frame(struct joypad *joypad, u8 *frame)
-{
-	struct file *filp = joypad->miyoo.filp;
-
-	return kernel_read(filp, frame, MIYOO_FRAME_SIZE, &filp->f_pos);
-}
-
-/* Set 9600 8N1, raw, directly on the tty instead of through an ioctl. */
-static void joypad_miyoo_set_termios(struct file *filp)
-{
-	struct tty_file_private *priv = filp->private_data;
-	struct ktermios termios;
-	struct tty_struct *tty;
-
-	if (!priv || !priv->tty)
-		return;
-	tty = priv->tty;
-
-	termios = tty->termios;
-	termios.c_iflag = 0;
-	termios.c_oflag = 0;
-	termios.c_cflag = B9600 | CS8 | CREAD | CLOCAL;
-	termios.c_lflag = 0;
-	memset(termios.c_cc, 0, NCCS);
-	termios.c_cc[VMIN] = 1;
-	termios.c_cc[VTIME] = 0;
-
-	tty_set_termios(tty, &termios);
-}
-
-static int joypad_miyoo_open(struct joypad *joypad)
-{
-	struct file *filp;
-
-	filp = filp_open(MIYOO_TTY_PATH, O_RDWR | O_NOCTTY, 0);
-	if (IS_ERR(filp)) {
-		dev_err(joypad->dev, "ERROR: open " MIYOO_TTY_PATH " failed: %ld\n",
-			PTR_ERR(filp));
-		return PTR_ERR(filp);
-	}
-	joypad->miyoo.filp = filp;
-
-	joypad_miyoo_set_termios(filp);
-
-	dev_info(joypad->dev,
-		 "Opened serial port " MIYOO_TTY_PATH " and set 9600 8N1 (in-kernel).\n");
-	return 0;
-}
-
-static void joypad_miyoo_close(struct joypad *joypad)
-{
-	if (!joypad->miyoo.filp)
-		return;
-
-	dev_info(joypad->dev, "Closing " MIYOO_TTY_PATH ".\n");
-	filp_close(joypad->miyoo.filp, NULL);
-	joypad->miyoo.filp = NULL;
-}
+/* Input device */
 
 /*
- * Re-open the tty after a quiet period. The sticks are not calibrated
- * again. Whether or not the open works, the inactivity timer restarts, so
- * a failed open is retried after another quiet period.
+ * The ROCKNIX adc-keys kernel patch exports "joypad_input_g" and reports
+ * keycode 316 (BTN_MODE) through the input device stored in it, so that the
+ * key comes from the joypad. Only the single ADC layout takes part.
+ *
+ * The symbol is looked up at run time, so the module also loads on kernels
+ * without the patch. Since Linux 6.6 that lookup only finds symbols exported
+ * with EXPORT_SYMBOL_GPL(), so the patch has to export it that way.
  */
-static void joypad_miyoo_reopen(struct joypad *joypad)
+static void joypad_adc_keys_hook(struct joypad *joypad)
 {
-	joypad_miyoo_close(joypad);
+	struct input_dev **slot;
 
-	if (joypad_miyoo_open(joypad) == 0)
-		dev_info(joypad->dev, "TTY re-init success!\n");
-	else
-		dev_err(joypad->dev, "Failed to re-open " MIYOO_TTY_PATH "; will retry.\n");
-
-	joypad->miyoo.last_data_jiffies = jiffies;
-}
-
-static bool joypad_miyoo_inactive(struct joypad *joypad)
-{
-	return time_after(jiffies, joypad->miyoo.last_data_jiffies +
-				   MIYOO_INACTIVITY_TIMEOUT);
-}
-
-/* Average the first frames to find the centre of each stick. */
-static int joypad_miyoo_autocal(struct joypad *joypad)
-{
-	struct joypad_miyoo *miyoo = &joypad->miyoo;
-	long sum_yl = 0, sum_xl = 0, sum_yr = 0, sum_xr = 0;
-	u8 frame[MIYOO_FRAME_SIZE];
-	int frames = 0;
-
-	dev_info(joypad->dev, "Auto-calibration: reading %d frames...",
-		 MIYOO_CALIBRATION_FRAMES);
-
-	while (frames < MIYOO_CALIBRATION_FRAMES) {
-		ssize_t n = joypad_miyoo_read_frame(joypad, frame);
-
-		if (n < 0) {
-			dev_err(joypad->dev, "Auto-cal read error: %zd\n", n);
-			msleep(10);
-			continue;
-		}
-		if (n < MIYOO_FRAME_SIZE) {
-			msleep(10);
-			continue;
-		}
-		if (frame[0] == MIYOO_MAGIC_START && frame[5] == MIYOO_MAGIC_END) {
-			sum_yl += frame[1];
-			sum_xl += frame[2];
-			sum_yr += frame[3];
-			sum_xr += frame[4];
-			frames++;
-		}
-	}
-
-	miyoo->left[0].zero = sum_xl / frames;
-	miyoo->left[1].zero = sum_yl / frames;
-	miyoo->right[0].zero = sum_xr / frames;
-	miyoo->right[1].zero = sum_yr / frames;
-
-	dev_info(joypad->dev, "  Average YL=%d, XL=%d, YR=%d, XR=%d\n",
-		 miyoo->left[1].zero, miyoo->left[0].zero,
-		 miyoo->right[1].zero, miyoo->right[0].zero);
-	dev_info(joypad->dev, "Auto-calibration complete.\n");
-	return 0;
-}
-
-static int joypad_miyoo_thread(void *data)
-{
-	struct joypad *joypad = data;
-	u8 frame[MIYOO_FRAME_SIZE];
-
-	dev_info(joypad->dev, "Starting Miyoo serial read loop.\n");
-
-	while (!kthread_should_stop()) {
-		ssize_t n;
-
-		/* The last re-open failed: wait out the timer and try again. */
-		if (!joypad->miyoo.filp) {
-			msleep(10);
-			if (joypad_miyoo_inactive(joypad))
-				joypad_miyoo_reopen(joypad);
-			continue;
-		}
-
-		n = joypad_miyoo_read_frame(joypad, frame);
-		if (n < 0) {
-			dev_err(joypad->dev, "Serial read error: %zd\n", n);
-			msleep(10);
-			continue;
-		}
-		if (n < MIYOO_FRAME_SIZE) {
-			msleep(10);
-			continue;
-		}
-
-		joypad_miyoo_parse(joypad, frame);
-
-		if (joypad_miyoo_inactive(joypad)) {
-			dev_warn(joypad->dev,
-				 "No data from " MIYOO_TTY_PATH " for 5s; re-opening TTY.\n");
-			joypad_miyoo_reopen(joypad);
-		}
-	}
-
-	dev_info(joypad->dev, "Miyoo serial thread exiting.\n");
-	return 0;
-}
-
-static void joypad_miyoo_start(struct work_struct *work)
-{
-	struct joypad_miyoo *miyoo = container_of(to_delayed_work(work),
-						  struct joypad_miyoo,
-						  start_work);
-	struct joypad *joypad = container_of(miyoo, struct joypad, miyoo);
-	struct task_struct *thread;
-	int error;
-
-	dev_info(joypad->dev, "Starting " MIYOO_TTY_PATH " init after driver load.\n");
-
-	if (joypad_miyoo_open(joypad))
+	if (!joypad_is_single_adc(joypad) || joypad->adc_keys_hooked)
 		return;
 
-	/* The only calibration; re-opening the tty later does not repeat it. */
-	error = joypad_miyoo_autocal(joypad);
-	if (error)
-		dev_err(joypad->dev, "Auto-calibration failed: %d\n", error);
-
-	/* Start the inactivity timer before the reader thread can check it. */
-	miyoo->last_data_jiffies = jiffies;
-
-	thread = kthread_run(joypad_miyoo_thread, joypad, "miyoo-serial-thread");
-	if (IS_ERR(thread)) {
-		dev_err(joypad->dev, "Failed to create Miyoo serial thread.\n");
-		joypad_miyoo_close(joypad);
+	slot = __symbol_get("joypad_input_g");
+	if (!slot)
 		return;
-	}
-	miyoo->thread = thread;
 
-	dev_info(joypad->dev, "Miyoo serial logic started successfully!\n");
+	*slot = joypad->input;
+	joypad->adc_keys_hooked = true;
 }
-
-static void joypad_miyoo_init(struct joypad *joypad)
-{
-	static const struct joypad_miyoo_cal defaults = {
-		.min	= MIYOO_RAW_MIN,
-		.max	= MIYOO_RAW_MAX,
-		.zero	= MIYOO_RAW_ZERO,
-	};
-	struct joypad_miyoo *miyoo = &joypad->miyoo;
-
-	miyoo->left[0] = defaults;
-	miyoo->left[1] = defaults;
-	miyoo->right[0] = defaults;
-	miyoo->right[1] = defaults;
-
-	miyoo->left_x = 0;
-	miyoo->left_y = 0;
-	miyoo->right_x = 0;
-	miyoo->right_y = 0;
-}
-
-static void joypad_report_miyoo(struct joypad *joypad)
-{
-	struct input_dev *input = joypad->input;
-
-	input_report_abs(input, ABS_X, READ_ONCE(joypad->miyoo.left_x));
-	input_report_abs(input, ABS_Y, READ_ONCE(joypad->miyoo.left_y));
-	input_report_abs(input, ABS_RX, READ_ONCE(joypad->miyoo.right_x));
-	input_report_abs(input, ABS_RY, READ_ONCE(joypad->miyoo.right_y));
-	input_sync(input);
-}
-
-/*----------------------------------------------------------------------------*/
-/* Input device */
 
 static void joypad_poll(struct input_dev *input)
 {
@@ -863,11 +536,7 @@ static void joypad_poll(struct input_dev *input)
 	if (!joypad->enable)
 		return;
 
-	if (joypad->use_miyoo_serial)
-		joypad_report_miyoo(joypad);
-	else
-		joypad_report_sticks(joypad);
-
+	joypad_report_sticks(joypad);
 	joypad_report_buttons(joypad);
 }
 
@@ -875,6 +544,9 @@ static int joypad_open(struct input_dev *input)
 {
 	struct joypad *joypad = input_get_drvdata(input);
 	int i;
+
+	/* In case adc-keys is a module that was loaded after the probe. */
+	joypad_adc_keys_hook(joypad);
 
 	if (joypad_is_single_adc(joypad)) {
 		/* Report the current state of every button straight away. */
@@ -944,10 +616,7 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 	input_set_drvdata(input, joypad);
 	joypad->input = input;
 
-#ifdef ROCKNIX_JOYPAD_ADC_KEYS_HOOK
-	if (joypad_is_single_adc(joypad))
-		joypad_input_g = input;
-#endif
+	joypad_adc_keys_hook(joypad);
 
 	input->name = variant->name;
 	device_property_read_string(dev, "joypad-name", &input->name);
@@ -963,8 +632,7 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 	input->id.version = (u16)revision;
 
 	/* Analog axes: (0 mV ~ 1800 mV) * scale, centred on zero. */
-	if (!joypad_is_single_adc(joypad) || joypad->axis_count > 0 ||
-	    joypad->use_miyoo_serial)
+	if (!joypad_is_single_adc(joypad) || joypad->axis_count > 0)
 		__set_bit(EV_ABS, input->evbit);
 
 	for (i = 0; i < joypad->axis_count; i++) {
@@ -981,18 +649,6 @@ static int joypad_input_setup(struct device *dev, struct joypad *joypad)
 			 "axis %s: adc tuning_p = %d, adc tuning_n = %d invert = %d\n",
 			 axis->name, axis->tuning_p, axis->tuning_n,
 			 axis->invert);
-	}
-
-	/* The Miyoo sticks always provide all four axes. */
-	if (joypad->use_miyoo_serial) {
-		input_set_abs_params(input, ABS_X, MIYOO_AXIS_MIN, MIYOO_AXIS_MAX,
-				     MIYOO_AXIS_FUZZ, MIYOO_AXIS_FLAT);
-		input_set_abs_params(input, ABS_Y, MIYOO_AXIS_MIN, MIYOO_AXIS_MAX,
-				     MIYOO_AXIS_FUZZ, MIYOO_AXIS_FLAT);
-		input_set_abs_params(input, ABS_RX, MIYOO_AXIS_MIN, MIYOO_AXIS_MAX,
-				     MIYOO_AXIS_FUZZ, MIYOO_AXIS_FLAT);
-		input_set_abs_params(input, ABS_RY, MIYOO_AXIS_MIN, MIYOO_AXIS_MAX,
-				     MIYOO_AXIS_FUZZ, MIYOO_AXIS_FLAT);
 	}
 
 	if (joypad->has_rumble) {
@@ -1341,10 +997,11 @@ static int joypad_parse_dt(struct device *dev, struct joypad *joypad)
 			 device_property_present(dev, "invert-absrx"),
 			 device_property_present(dev, "invert-absry"));
 
-		/* Not fatal: the Miyoo serial sticks need no ADC. */
-		if (joypad->axis_count == 0 && joypad->button_count == 0)
+		if (joypad->axis_count == 0 && joypad->button_count == 0) {
 			dev_err(dev, "adc key = %d, gpio key = %d error!",
 				joypad->axis_count, joypad->button_count);
+			return -EINVAL;
+		}
 
 		if (joypad->axis_count > 0) {
 			error = joypad_single_adc_setup(dev, joypad);
@@ -1372,18 +1029,11 @@ static int joypad_parse_dt(struct device *dev, struct joypad *joypad)
 	dev_info(dev, "adc key cnt = %d, gpio key cnt = %d\n",
 		 joypad->axis_count, joypad->button_count);
 
-	/* Rumble and the Miyoo sticks only exist on the single ADC layout. */
+	/* Rumble only exists on the single ADC layout. */
 	if (joypad_is_single_adc(joypad)) {
 		joypad->has_rumble = device_property_present(dev, "pwm-names");
 		if (joypad->has_rumble)
 			dev_info(dev, "has rumble\n");
-
-		joypad->use_miyoo_serial =
-			device_property_present(dev, "rocknix,use-miyoo-serial-joypad");
-		if (joypad->use_miyoo_serial) {
-			dev_info(dev, "using Miyoo Serial Joypad logic\n");
-			joypad_miyoo_init(joypad);
-		}
 	}
 
 	return 0;
@@ -1475,12 +1125,6 @@ static int joypad_probe(struct platform_device *pdev)
 		}
 
 		joypad->rumble_enabled = true;
-	}
-
-	if (joypad->use_miyoo_serial) {
-		/* Open the tty later, so probe and boot are never blocked. */
-		INIT_DELAYED_WORK(&joypad->miyoo.start_work, joypad_miyoo_start);
-		schedule_delayed_work(&joypad->miyoo.start_work, MIYOO_START_DELAY);
 	}
 
 	dev_info(dev, "probe success\n");
